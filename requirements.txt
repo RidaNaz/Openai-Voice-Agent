@@ -1,0 +1,6 @@
+vosk
+scipy
+numpy
+pyttsx3
+python-dotenv
+openai-agents[voice]
