@@ -9,5 +9,6 @@ dependencies = [
     "pyttsx3>=2.98",
     "scipy>=1.15.2",
     "sounddevice>=0.5.1",
+    "textual>=3.2.0",
     "vosk>=0.3.45",
 ]

@@ -1,6 +1,3 @@
-vosk
-scipy
-numpy
-pyttsx3
+textual
 python-dotenv
 openai-agents[voice]

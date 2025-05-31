@@ -1,93 +1,233 @@
-import os
-import random
+from __future__ import annotations
+
 import asyncio
+from typing import TYPE_CHECKING
 
 import numpy as np
 import sounddevice as sd
-from dotenv import load_dotenv
+from textual import events
+from textual.app import App, ComposeResult
+from textual.containers import Container
+from textual.reactive import reactive
+from textual.widgets import Button, RichLog, Static
+from typing_extensions import override
 
-from agents import (
-    Agent,
-    function_tool,
-    AsyncOpenAI,
-    OpenAIChatCompletionsModel
+from agents.voice import StreamedAudioInput, VoicePipeline
 
-)
-from agents.voice import (
-    AudioInput,
-    VoicePipeline,
-    SingleAgentVoiceWorkflow,
-)
-from agents.run import RunConfig
-from agents import set_default_openai_client
-from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
+# Import MyWorkflow class - handle both module and package use cases
+if TYPE_CHECKING:
+    # For type checking, use the relative import
+    from .my_workflow import MyWorkflow
+else:
+    # At runtime, try both import styles
+    try:
+        # Try relative import first (when used as a package)
+        from .my_workflow import MyWorkflow
+    except ImportError:
+        # Fall back to direct import (when run as a script)
+        from my_workflow import MyWorkflow
 
-load_dotenv()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-external_client = AsyncOpenAI(
-    api_key="AIzaSyCNU7yLsXzjxyd-sVDIZTMQyAKkaRay3pg",
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-)
-
-set_default_openai_client(external_client)
-
-model = OpenAIChatCompletionsModel (
-    model="gemini-2.0-flash",
-    openai_client=external_client
-)
-
-config = RunConfig (
-    model=model,
-    model_provider = external_client,
-    tracing_disabled = True
-)
-
-@function_tool
-def get_weather(city: str) -> str:
-    """Get the weather for a given city."""
-    print(f"[debug] get_weather called with city: {city}")
-    choices = ["sunny", "cloudy", "rainy", "snowy"]
-    return f"The weather in {city} is {random.choice(choices)}."
+CHUNK_LENGTH_S = 0.05  # 100ms
+SAMPLE_RATE = 24000
+FORMAT = np.int16
+CHANNELS = 1
 
 
-spanish_agent = Agent(
-    name="Spanish",
-    handoff_description="A spanish speaking agent.",
-    instructions=prompt_with_handoff_instructions(
-        "You're speaking to a human, so be polite and concise. Speak in Spanish.",
-    ),
-    model=model,
-)
+class Header(Static):
+    """A header widget."""
 
-agent = Agent(
-    name="Assistant",
-    instructions=prompt_with_handoff_instructions(
-        "You're speaking to a human, so be polite and concise. If the user speaks in Spanish, handoff to the spanish agent.",
-    ),
-    model=model,
-    handoffs=[spanish_agent],
-    tools=[get_weather],
-)
+    session_id = reactive("")
+
+    @override
+    def render(self) -> str:
+        return "Speak to the agent. When you stop speaking, it will respond."
 
 
-async def main():
-    pipeline = VoicePipeline(workflow=SingleAgentVoiceWorkflow(agent))
-    buffer = np.zeros(24000 * 3, dtype=np.int16)
-    audio_input = AudioInput(buffer=buffer)
+class AudioStatusIndicator(Static):
+    """A widget that shows the current audio recording status."""
 
-    result = await pipeline.run(audio_input)
+    is_recording = reactive(False)
 
-    # Create an audio player using `sounddevice`
-    player = sd.OutputStream(samplerate=24000, channels=1, dtype=np.int16)
-    player.start()
+    @override
+    def render(self) -> str:
+        status = (
+            "🔴 Recording... (Press K to stop)"
+            if self.is_recording
+            else "⚪ Press K to start recording (Q to quit)"
+        )
+        return status
 
-    # Play the audio stream as it comes in
-    async for event in result.stream():
-        if event.type == "voice_stream_event_audio":
-            player.write(event.data)
+
+class RealtimeApp(App[None]):
+    CSS = """
+        Screen {
+            background: #1a1b26;  /* Dark blue-grey background */
+        }
+
+        Container {
+            border: double rgb(91, 164, 91);
+        }
+
+        Horizontal {
+            width: 100%;
+        }
+
+        #input-container {
+            height: 5;  /* Explicit height for input container */
+            margin: 1 1;
+            padding: 1 2;
+        }
+
+        Input {
+            width: 80%;
+            height: 3;  /* Explicit height for input */
+        }
+
+        Button {
+            width: 20%;
+            height: 3;  /* Explicit height for button */
+        }
+
+        #bottom-pane {
+            width: 100%;
+            height: 82%;  /* Reduced to make room for session display */
+            border: round rgb(205, 133, 63);
+            content-align: center middle;
+        }
+
+        #status-indicator {
+            height: 3;
+            content-align: center middle;
+            background: #2a2b36;
+            border: solid rgb(91, 164, 91);
+            margin: 1 1;
+        }
+
+        #session-display {
+            height: 3;
+            content-align: center middle;
+            background: #2a2b36;
+            border: solid rgb(91, 164, 91);
+            margin: 1 1;
+        }
+
+        Static {
+            color: white;
+        }
+    """
+
+    should_send_audio: asyncio.Event
+    audio_player: sd.OutputStream
+    last_audio_item_id: str | None
+    connected: asyncio.Event
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_audio_item_id = None
+        self.should_send_audio = asyncio.Event()
+        self.connected = asyncio.Event()
+        self.pipeline = VoicePipeline(
+            workflow=MyWorkflow(secret_word="hi", on_start=self._on_transcription)
+        )
+        self._audio_input = StreamedAudioInput()
+        self.audio_player = sd.OutputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype=FORMAT,
+        )
+
+    def _on_transcription(self, transcription: str) -> None:
+        try:
+            self.query_one("#bottom-pane", RichLog).write(f"Transcription: {transcription}")
+        except Exception:
+            pass
+
+    @override
+    def compose(self) -> ComposeResult:
+        """Create child widgets for the app."""
+        with Container():
+            yield Header(id="session-display")
+            yield AudioStatusIndicator(id="status-indicator")
+            yield RichLog(id="bottom-pane", wrap=True, highlight=True, markup=True)
+
+    async def on_mount(self) -> None:
+        self.run_worker(self.start_voice_pipeline())
+        self.run_worker(self.send_mic_audio())
+
+    async def start_voice_pipeline(self) -> None:
+        try:
+            self.audio_player.start()
+            self.result = await self.pipeline.run(self._audio_input)
+
+            async for event in self.result.stream():
+                bottom_pane = self.query_one("#bottom-pane", RichLog)
+                if event.type == "voice_stream_event_audio":
+                    self.audio_player.write(event.data)
+                    bottom_pane.write(
+                        f"Received audio: {len(event.data) if event.data is not None else '0'} bytes"
+                    )
+                elif event.type == "voice_stream_event_lifecycle":
+                    bottom_pane.write(f"Lifecycle event: {event.event}")
+        except Exception as e:
+            bottom_pane = self.query_one("#bottom-pane", RichLog)
+            bottom_pane.write(f"Error: {e}")
+        finally:
+            self.audio_player.close()
+
+    async def send_mic_audio(self) -> None:
+        device_info = sd.query_devices()
+        print(device_info)
+
+        read_size = int(SAMPLE_RATE * 0.02)
+
+        stream = sd.InputStream(
+            channels=CHANNELS,
+            samplerate=SAMPLE_RATE,
+            dtype="int16",
+        )
+        stream.start()
+
+        status_indicator = self.query_one(AudioStatusIndicator)
+
+        try:
+            while True:
+                if stream.read_available < read_size:
+                    await asyncio.sleep(0)
+                    continue
+
+                await self.should_send_audio.wait()
+                status_indicator.is_recording = True
+
+                data, _ = stream.read(read_size)
+
+                await self._audio_input.add_audio(data)
+                await asyncio.sleep(0)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stream.stop()
+            stream.close()
+
+    async def on_key(self, event: events.Key) -> None:
+        """Handle key press events."""
+        if event.key == "enter":
+            self.query_one(Button).press()
+            return
+
+        if event.key == "q":
+            self.exit()
+            return
+
+        if event.key == "k":
+            status_indicator = self.query_one(AudioStatusIndicator)
+            if status_indicator.is_recording:
+                self.should_send_audio.clear()
+                status_indicator.is_recording = False
+            else:
+                self.should_send_audio.set()
+                status_indicator.is_recording = True
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app = RealtimeApp()
+    app.run()
